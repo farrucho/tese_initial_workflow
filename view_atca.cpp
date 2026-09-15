@@ -137,6 +137,7 @@ int main(int argc, char **argv) {
     }
 
     StreamGuard stream_guard(control_fd);
+    bool started_stream = false;
     std::uint32_t control = 0;
     std::uint32_t status = 0;
     if (::ioctl(control_fd, kGetControl, &control) < 0 ||
@@ -155,6 +156,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         stream_guard.mark_started();
+        started_stream = true;
         std::cout << "RT stream was OFF; temporarily enabled it.\n";
     } else {
         std::cout << "RT stream was already ON; it will be left ON.\n";
@@ -174,6 +176,11 @@ int main(int argc, char **argv) {
         ::close(fd);
         return 1;
     }
+
+    // The circular page can still contain packets from a previous run. At
+    // 10 kHz, 5 ms is ample time for all eight 256-byte slots to be replaced.
+    if (started_stream)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
     auto *packets = static_cast<volatile Packet *>(mapping);
     std::cout << "Viewing " << device << " (no acquisition, IRQ or trigger).\n";
