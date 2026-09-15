@@ -3,10 +3,10 @@
 Este programa mostra no terminal os 16 valores `int32` mais recentes da placa
 9. Lê apenas o buffer RT já existente em `/dev/atca_v6_dmart_9`.
 
-Não usa MARTe, `ioctl`, IRQ, trigger ou configuração da placa. Abrir e mapear
-este nó é passivo segundo a implementação do driver. Se o stream não estiver
-ativo, o programa não o inicia: mostra valores inalterados e termina com um
-aviso.
+Não usa MARTe, aquisição raw, IRQ ou trigger. Se o fluxo RT estiver desligado,
+o programa liga apenas o bit `StreamE`, mostra os dados e volta a desligá-lo no
+fim. Se já estiver ligado, deixa-o ligado. O programa recusa alterar o stream
+se detetar uma aquisição ativa.
 
 No servidor, basta executar:
 

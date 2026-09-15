@@ -1,4 +1,5 @@
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
@@ -6,6 +7,7 @@
 #include <iostream>
 #include <string>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <thread>
 #include <unistd.h>
 
@@ -13,6 +15,39 @@ namespace {
 
 constexpr std::size_t kChannels = 16;
 constexpr std::size_t kBuffers = 8;
+constexpr unsigned char kIoctlMagic = 'k';
+constexpr unsigned long kGetStatus = _IOR(kIoctlMagic, 8, std::uint32_t);
+constexpr unsigned long kStreamEnable = _IO(kIoctlMagic, 13);
+constexpr unsigned long kStreamDisable = _IO(kIoctlMagic, 14);
+constexpr unsigned long kGetControl = _IOR(kIoctlMagic, 26, std::uint32_t);
+constexpr std::uint32_t kStreamBit = 1U << 20;
+constexpr std::uint32_t kAcquisitionBit = 1U << 23;
+constexpr std::uint32_t kAcquisitionOnStatusBit = 1U << 12;
+
+volatile std::sig_atomic_t keep_running = 1;
+
+void stop_on_signal(int) {
+    keep_running = 0;
+}
+
+class StreamGuard {
+public:
+    explicit StreamGuard(int fd) : fd_(fd) {}
+    void mark_started() { started_ = true; }
+    ~StreamGuard() {
+        if (started_) {
+            if (::ioctl(fd_, kStreamDisable) < 0)
+                std::cerr << "WARNING: could not restore StreamE=0: "
+                          << std::strerror(errno) << "\n";
+            else
+                std::cout << "RT stream returned to its initial OFF state.\n";
+        }
+        ::close(fd_);
+    }
+private:
+    int fd_;
+    bool started_ = false;
+};
 
 // Exact 256-byte RT packet exported by atca_v6_stream.
 struct Packet {
@@ -87,6 +122,37 @@ int main(int argc, char **argv) {
     }
 
     const std::string device = "/dev/atca_v6_dmart_" + std::to_string(board);
+    const std::string control_device = "/dev/atca_v6_" + std::to_string(board);
+    const int control_fd = ::open(control_device.c_str(), O_RDONLY | O_CLOEXEC);
+    if (control_fd < 0) {
+        std::cerr << "Could not open " << control_device << ": " << std::strerror(errno) << "\n";
+        return 1;
+    }
+
+    StreamGuard stream_guard(control_fd);
+    std::uint32_t control = 0;
+    std::uint32_t status = 0;
+    if (::ioctl(control_fd, kGetControl, &control) < 0 ||
+        ::ioctl(control_fd, kGetStatus, &status) < 0) {
+        std::cerr << "Could not read board state: " << std::strerror(errno) << "\n";
+        return 1;
+    }
+    if ((control & kAcquisitionBit) != 0 || (status & kAcquisitionOnStatusBit) != 0) {
+        std::cerr << "Refusing to change streaming while an acquisition is active"
+                  << " (control=0x" << std::hex << control << ", status=0x" << status << ").\n";
+        return 2;
+    }
+    if ((control & kStreamBit) == 0) {
+        if (::ioctl(control_fd, kStreamEnable) < 0) {
+            std::cerr << "Could not enable the RT stream: " << std::strerror(errno) << "\n";
+            return 1;
+        }
+        stream_guard.mark_started();
+        std::cout << "RT stream was OFF; temporarily enabled it.\n";
+    } else {
+        std::cout << "RT stream was already ON; it will be left ON.\n";
+    }
+
     const int fd = ::open(device.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         std::cerr << "Could not open " << device << ": " << std::strerror(errno) << "\n";
@@ -103,7 +169,7 @@ int main(int argc, char **argv) {
     }
 
     auto *packets = static_cast<volatile Packet *>(mapping);
-    std::cout << "Viewing " << device << " passively (no ioctl/trigger/configuration).\n";
+    std::cout << "Viewing " << device << " (no acquisition, IRQ or trigger).\n";
     std::cout << "counter    sample";
     for (std::size_t channel = 0; channel < kChannels; ++channel)
         std::cout << "       ch" << std::setw(2) << std::setfill('0') << channel;
@@ -112,7 +178,9 @@ int main(int argc, char **argv) {
     std::uint32_t previous_counter = 0;
     bool have_previous = false;
     unsigned unchanged = 0;
-    for (unsigned line = 0; line < readings; ++line) {
+    std::signal(SIGINT, stop_on_signal);
+    std::signal(SIGTERM, stop_on_signal);
+    for (unsigned line = 0; line < readings && keep_running; ++line) {
         Packet packet{};
         if (!find_newest(packets, packet)) {
             std::cout << "No complete DMA packet is currently visible.\n";
@@ -136,7 +204,7 @@ int main(int argc, char **argv) {
     ::munmap(mapping, static_cast<std::size_t>(page_size));
     ::close(fd);
     if (!have_previous || unchanged + 1 >= readings) {
-        std::cerr << "The RT buffer did not change; the stream may be stopped.\n";
+        std::cerr << "The RT buffer did not change after enabling streaming.\n";
         return 3;
     }
     return 0;
