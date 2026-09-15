@@ -26,6 +26,7 @@ Por exemplo, placa 9, 10 leituras, uma a cada segundo:
 ./run.sh 9 10 1000
 ```
 
-Os valores são os inteiros disponibilizados pelo fluxo RT do FPGA, sem
-calibração para volts. Este fluxo já foi decimado pelo FPGA; não contém todas
-as amostras originais a 2 MHz.
+Os valores apresentados são contagens ADC (`valor_do_FPGA / 2^14`), seguindo o
+descodificador que acompanha o driver. Não são calibrados para volts. Este
+fluxo já foi decimado pelo FPGA; não contém todas as amostras originais a
+2 MHz.

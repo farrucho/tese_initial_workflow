@@ -15,6 +15,7 @@ namespace {
 
 constexpr std::size_t kChannels = 16;
 constexpr std::size_t kBuffers = 8;
+constexpr std::int32_t kAdcScale = 1 << 14;
 constexpr unsigned char kIoctlMagic = 'k';
 constexpr unsigned long kGetStatus = _IOR(kIoctlMagic, 8, std::uint32_t);
 constexpr unsigned long kStreamEnable = _IO(kIoctlMagic, 13);
@@ -28,6 +29,12 @@ volatile std::sig_atomic_t keep_running = 1;
 
 void stop_on_signal(int) {
     keep_running = 0;
+}
+
+std::int32_t adc_counts(std::int32_t packed_value) {
+    if (packed_value >= 0) return packed_value / kAdcScale;
+    const std::int64_t magnitude = -static_cast<std::int64_t>(packed_value);
+    return static_cast<std::int32_t>(-((magnitude + kAdcScale - 1) / kAdcScale));
 }
 
 class StreamGuard {
@@ -191,8 +198,8 @@ int main(int argc, char **argv) {
             if (changed) unchanged = 0;
             std::cout << std::setw(10) << packet.head_time_count << " "
                       << std::setw(9) << packet.sample_count;
-            for (const std::int32_t value : packet.adc)
-                std::cout << " " << std::setw(10) << value;
+            for (const std::int32_t packed_value : packet.adc)
+                std::cout << " " << std::setw(10) << adc_counts(packed_value);
             std::cout << (changed ? "" : "  (unchanged)") << "\n";
             previous_counter = packet.head_time_count;
             have_previous = true;
