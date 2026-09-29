@@ -6,7 +6,7 @@ canal, sem MARTe. Usa a interface DMA de `/dev/atca_v6_9`.
 ## Utilização
 
 ```bash
-./run.sh -t 1 -o dados.bin
+./run.sh -t 1 -o analysis/dados.bin
 ```
 
 - `-t`: duração pedida, em segundos;
@@ -20,6 +20,22 @@ A captura mínima é de 16 buffers: 65,536 ms e 8 MiB.
 
 É criado também `dados.bin.json`, com duração efetiva, tamanho do buffer,
 número de amostras, estado inicial, chopper, kernel e formato.
+
+## Organização
+
+```text
+code/
+  capture_atca.cpp       código da aquisição
+analysis/
+  inspect_capture.py     inspeção e estatísticas
+  *.bin                  capturas (não entram no Git)
+  *.bin.json             metadados (não entram no Git)
+run.sh                   compila e executa a aquisição
+```
+
+O executável é criado automaticamente em `code/capture_atca`. As capturas
+devem ser guardadas em `analysis/`; os binários e respetivos metadados são
+ignorados pelo Git para evitar enviar ficheiros de centenas de megabytes.
 
 ## Formato
 
@@ -49,7 +65,7 @@ os mecanismos que iniciou.
 ## Inspeção local
 
 ```bash
-python3 inspect_capture.py dados.bin
+python3 analysis/inspect_capture.py analysis/dados.bin
 ```
 
 Mostra tamanho, número de amostras e estatísticas por canal, sem dependências

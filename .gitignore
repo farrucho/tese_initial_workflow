@@ -1,5 +1,4 @@
-capture_atca
-view_atca
+code/capture_atca
 __pycache__/
 *.bin
 *.bin.json
