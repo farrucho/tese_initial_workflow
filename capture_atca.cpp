@@ -1,0 +1,277 @@
+#include <cerrno>
+#include <chrono>
+#include <cmath>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <fcntl.h>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <sys/ioctl.h>
+#include <sys/statvfs.h>
+#include <sys/utsname.h>
+#include <unistd.h>
+#include <vector>
+
+namespace {
+constexpr std::uint64_t kAdcRateHz = 2'000'000;
+constexpr std::uint64_t kChannels = 16;
+constexpr std::uint64_t kMinimumBuffers = 16;
+constexpr unsigned char kMagic = 'k';
+constexpr unsigned long kIrqEnable = _IO(kMagic, 1);
+constexpr unsigned long kIrqDisable = _IO(kMagic, 2);
+constexpr unsigned long kAcqEnable = _IO(kMagic, 3);
+constexpr unsigned long kAcqDisable = _IO(kMagic, 4);
+constexpr unsigned long kDmaDisable = _IO(kMagic, 6);
+constexpr unsigned long kSoftTrigger = _IO(kMagic, 7);
+constexpr unsigned long kGetStatus = _IOR(kMagic, 8, std::uint32_t);
+constexpr unsigned long kGetDmaSize = _IOR(kMagic, 11, std::uint32_t);
+constexpr unsigned long kDmaReset = _IO(kMagic, 12);
+constexpr unsigned long kGetChopper = _IOR(kMagic, 20, std::uint32_t);
+constexpr unsigned long kGetControl = _IOR(kMagic, 26, std::uint32_t);
+constexpr std::uint32_t kChopperOnBit = 1U << 10;
+constexpr std::uint32_t kStreamBit = 1U << 20;
+constexpr std::uint32_t kAcquisitionBit = 1U << 23;
+constexpr std::uint32_t kSoftwareTriggerBit = 1U << 24;
+constexpr std::uint32_t kDmaBit = 1U << 27;
+constexpr std::uint32_t kDmaResetBit = 1U << 28;
+constexpr std::uint32_t kIrqBit = 1U << 30;
+constexpr std::uint32_t kAcquisitionOnStatusBit = 1U << 12;
+
+volatile std::sig_atomic_t stop_requested = 0;
+void on_signal(int) { stop_requested = 1; }
+
+struct Options { unsigned board = 9; double duration = 0.0; std::string output; };
+
+void usage(const char *program) {
+    std::cout << "Usage: " << program << " -t SECONDS -o FILE.bin [-b BOARD]\n"
+              << "Captures all 16 raw int32 channels at 2 MSPS using software trigger.\n"
+              << "Duration is rounded up to a complete DMA buffer.\n";
+}
+
+bool parse_options(int argc, char **argv, Options &options) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string option = argv[i];
+        if (option == "-h" || option == "--help") { usage(argv[0]); std::exit(0); }
+        if ((option != "-t" && option != "-o" && option != "-b") || i + 1 >= argc) {
+            std::cerr << "Unknown option or missing value: " << option << "\n"; return false;
+        }
+        const char *value = argv[++i];
+        if (option == "-o") options.output = value;
+        else if (option == "-t") {
+            char *end = nullptr;
+            options.duration = std::strtod(value, &end);
+            if (end == value || *end != '\0' || !std::isfinite(options.duration) ||
+                options.duration <= 0.0 || options.duration > 3600.0) {
+                std::cerr << "Duration must be greater than zero and at most 3600 seconds.\n"; return false;
+            }
+        } else {
+            char *end = nullptr;
+            const unsigned long board = std::strtoul(value, &end, 10);
+            if (end == value || *end != '\0' || board > 255) {
+                std::cerr << "Invalid board number: " << value << "\n"; return false;
+            }
+            options.board = static_cast<unsigned>(board);
+        }
+    }
+    if (options.duration == 0.0 || options.output.empty()) {
+        std::cerr << "Both -t SECONDS and -o FILE.bin are required.\n"; return false;
+    }
+    return true;
+}
+
+bool ioctl_ok(int fd, unsigned long request, void *argument, const char *name) {
+    if (::ioctl(fd, request, argument) == 0) return true;
+    std::cerr << name << " failed: " << std::strerror(errno) << "\n"; return false;
+}
+bool ioctl_ok(int fd, unsigned long request, const char *name) {
+    if (::ioctl(fd, request) == 0) return true;
+    std::cerr << name << " failed: " << std::strerror(errno) << "\n"; return false;
+}
+
+class AcquisitionGuard {
+public:
+    explicit AcquisitionGuard(int fd) : fd_(fd) {}
+    void irq_enabled() { irq_ = true; }
+    void acquisition_enabled() { acquisition_ = true; }
+    int finish() {
+        if (finished_) return max_pending_;
+        ::ioctl(fd_, kDmaDisable);
+        if (acquisition_) max_pending_ = ::ioctl(fd_, kAcqDisable);
+        if (irq_) ::ioctl(fd_, kIrqDisable);
+        finished_ = true;
+        return max_pending_;
+    }
+    ~AcquisitionGuard() { finish(); }
+private:
+    int fd_; bool irq_ = false; bool acquisition_ = false; bool finished_ = false; int max_pending_ = -1;
+};
+
+bool write_all(int fd, const unsigned char *data, std::size_t size) {
+    while (size != 0) {
+        const ssize_t written = ::write(fd, data, size);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return false;
+        data += written; size -= static_cast<std::size_t>(written);
+    }
+    return true;
+}
+
+std::string json_escape(const std::string &text) {
+    std::ostringstream result;
+    for (const unsigned char c : text) {
+        if (c == '\\' || c == '"') result << '\\' << c;
+        else if (c >= 0x20) result << c;
+        else result << "\\u" << std::hex << std::setw(4) << std::setfill('0') << unsigned(c);
+    }
+    return result.str();
+}
+std::string utc_now() {
+    const std::time_t now = std::time(nullptr); std::tm value{}; gmtime_r(&now, &value);
+    char buffer[32]; std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &value); return buffer;
+}
+
+bool write_metadata(int fd, const Options &options, const std::string &device,
+                    std::uint32_t control, std::uint32_t status, std::uint32_t chopper,
+                    std::uint32_t dma_size, std::uint64_t wanted_buffers,
+                    std::uint64_t captured_buffers, bool complete, double wall_time,
+                    int max_pending_buffers) {
+    struct utsname system_info{}; ::uname(&system_info);
+    const std::uint64_t samples_per_buffer = dma_size / (kChannels * sizeof(std::int32_t));
+    const std::uint64_t samples = captured_buffers * samples_per_buffer;
+    std::ostringstream json;
+    json << std::fixed << std::setprecision(9) << "{\n"
+         << "  \"format_version\": 1,\n"
+         << "  \"created_utc\": \"" << utc_now() << "\",\n"
+         << "  \"device\": \"" << json_escape(device) << "\",\n"
+         << "  \"output_file\": \"" << json_escape(options.output) << "\",\n"
+         << "  \"complete\": " << (complete ? "true" : "false") << ",\n"
+         << "  \"requested_duration_s\": " << options.duration << ",\n"
+         << "  \"captured_duration_s\": " << static_cast<double>(samples) / kAdcRateHz << ",\n"
+         << "  \"wall_time_s\": " << wall_time << ",\n"
+         << "  \"adc_rate_hz\": " << kAdcRateHz << ",\n"
+         << "  \"channels\": " << kChannels << ",\n"
+         << "  \"sample_type\": \"int32 little-endian\",\n"
+         << "  \"layout\": \"sample-major interleaved: ch00..ch15\",\n"
+         << "  \"fpga_left_shift_bits\": 14,\n"
+         << "  \"dma_buffer_bytes\": " << dma_size << ",\n"
+         << "  \"samples_per_channel_per_buffer\": " << samples_per_buffer << ",\n"
+         << "  \"requested_buffers\": " << wanted_buffers << ",\n"
+         << "  \"captured_buffers\": " << captured_buffers << ",\n"
+         << "  \"samples_per_channel\": " << samples << ",\n"
+         << "  \"data_bytes\": " << captured_buffers * dma_size << ",\n"
+         << "  \"driver_max_pending_buffers\": " << max_pending_buffers << ",\n"
+         << "  \"software_trigger\": true,\n"
+         << "  \"chopper_enabled_initially\": " << ((control & kChopperOnBit) ? "true" : "false") << ",\n"
+         << "  \"chopper_counters_hex\": \"0x" << std::hex << std::setw(8) << std::setfill('0') << chopper << "\",\n"
+         << "  \"initial_control_hex\": \"0x" << std::setw(8) << control << "\",\n"
+         << "  \"initial_status_hex\": \"0x" << std::setw(8) << status << "\",\n" << std::dec
+         << "  \"kernel\": \"" << json_escape(system_info.release) << "\"\n}\n";
+    const std::string contents = json.str();
+    return write_all(fd, reinterpret_cast<const unsigned char *>(contents.data()), contents.size());
+}
+} // namespace
+
+int main(int argc, char **argv) {
+    Options options;
+    if (!parse_options(argc, argv, options)) { usage(argv[0]); return 2; }
+    std::signal(SIGINT, on_signal); std::signal(SIGTERM, on_signal);
+    const std::string metadata_path = options.output + ".json";
+    if (::access(options.output.c_str(), F_OK) == 0 || ::access(metadata_path.c_str(), F_OK) == 0) {
+        std::cerr << "Output or metadata file already exists; refusing to overwrite it.\n"; return 2;
+    }
+
+    const std::string device = "/dev/atca_v6_" + std::to_string(options.board);
+    const int device_fd = ::open(device.c_str(), O_RDONLY | O_CLOEXEC);
+    if (device_fd < 0) { std::cerr << "Could not open " << device << ": " << std::strerror(errno) << "\n"; return 1; }
+    std::uint32_t control = 0, status = 0, dma_size = 0, chopper = 0;
+    const bool state_ok = ioctl_ok(device_fd, kGetControl, &control, "get control") &&
+        ioctl_ok(device_fd, kGetStatus, &status, "get status") &&
+        ioctl_ok(device_fd, kGetDmaSize, &dma_size, "get DMA size") &&
+        ioctl_ok(device_fd, kGetChopper, &chopper, "get chopper counters");
+    if (!state_ok) { ::close(device_fd); return 1; }
+    const std::uint32_t active_mask = kStreamBit | kAcquisitionBit | kSoftwareTriggerBit | kDmaBit | kDmaResetBit | kIrqBit;
+    if ((control & active_mask) != 0 || (status & kAcquisitionOnStatusBit) != 0) {
+        std::cerr << "Board is not idle; refusing active raw capture (control=0x" << std::hex << control
+                  << ", status=0x" << status << ").\n"; ::close(device_fd); return 3;
+    }
+    if (dma_size == 0 || dma_size % (kChannels * sizeof(std::int32_t)) != 0 || dma_size > 64U * 1024U * 1024U) {
+        std::cerr << "Invalid DMA buffer size reported by driver: " << dma_size << " bytes.\n"; ::close(device_fd); return 1;
+    }
+
+    const std::uint64_t samples_per_buffer = dma_size / (kChannels * sizeof(std::int32_t));
+    const long double requested_samples = std::ceil(static_cast<long double>(options.duration) * kAdcRateHz);
+    const std::uint64_t buffers = std::max(kMinimumBuffers, static_cast<std::uint64_t>(
+        std::ceil(requested_samples / samples_per_buffer)));
+    if (buffers == 0 || buffers > std::numeric_limits<std::uint64_t>::max() / dma_size) {
+        std::cerr << "Requested capture is too large.\n"; ::close(device_fd); return 2;
+    }
+    const std::uint64_t output_bytes = buffers * dma_size;
+    const std::size_t slash = options.output.find_last_of('/');
+    const std::string output_directory = slash == std::string::npos ? "." :
+        (slash == 0 ? "/" : options.output.substr(0, slash));
+    struct statvfs filesystem{};
+    if (::statvfs(output_directory.c_str(), &filesystem) == 0) {
+        const std::uint64_t available = static_cast<std::uint64_t>(filesystem.f_bavail) * filesystem.f_frsize;
+        if (available < output_bytes + dma_size) {
+            std::cerr << "Insufficient free disk space: need " << output_bytes << " bytes, have "
+                      << available << " bytes.\n"; ::close(device_fd); return 1;
+        }
+    }
+
+    const int output_fd = ::open(options.output.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (output_fd < 0) { std::cerr << "Could not create output: " << std::strerror(errno) << "\n"; ::close(device_fd); return 1; }
+    const int metadata_fd = ::open(metadata_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (metadata_fd < 0) {
+        std::cerr << "Could not create metadata: " << std::strerror(errno) << "\n";
+        ::close(output_fd); ::unlink(options.output.c_str()); ::close(device_fd); return 1;
+    }
+
+    const double exact_duration = static_cast<double>(buffers * samples_per_buffer) / kAdcRateHz;
+    const double size_mib = static_cast<double>(buffers * dma_size) / (1024.0 * 1024.0);
+    std::cout << "Raw capture: " << device << ", 16 channels at 2 MSPS\nRequested " << options.duration
+              << " s; capturing " << exact_duration << " s in " << buffers << " DMA buffers (" << size_mib << " MiB).\n";
+
+    AcquisitionGuard guard(device_fd); std::vector<unsigned char> buffer(dma_size);
+    std::uint64_t captured = 0; bool capture_ok = ioctl_ok(device_fd, kDmaReset, "DMA reset");
+    if (capture_ok) { capture_ok = ioctl_ok(device_fd, kIrqEnable, "enable IRQ"); if (capture_ok) guard.irq_enabled(); }
+    if (capture_ok) { capture_ok = ioctl_ok(device_fd, kAcqEnable, "enable acquisition"); if (capture_ok) guard.acquisition_enabled(); }
+    if (capture_ok) capture_ok = ioctl_ok(device_fd, kSoftTrigger, "software trigger");
+    const auto wall_start = std::chrono::steady_clock::now();
+    while (capture_ok && !stop_requested && captured < buffers) {
+        const ssize_t received = ::read(device_fd, buffer.data(), buffer.size());
+        if (received < 0 && errno == EINTR && !stop_requested) continue;
+        if (received != static_cast<ssize_t>(buffer.size())) {
+            if (received < 0) std::cerr << "DMA read failed: " << std::strerror(errno) << "\n";
+            else std::cerr << "DMA read returned " << received << " bytes; expected " << buffer.size() << ".\n";
+            capture_ok = false; break;
+        }
+        if (!write_all(output_fd, buffer.data(), buffer.size())) {
+            std::cerr << "Output write failed: " << std::strerror(errno) << "\n"; capture_ok = false; break;
+        }
+        ++captured;
+    }
+    const int max_pending = guard.finish();
+    const double wall_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
+    if (::fsync(output_fd) != 0) { std::cerr << "Could not flush output: " << std::strerror(errno) << "\n"; capture_ok = false; }
+    ::close(output_fd);
+    const bool complete = capture_ok && !stop_requested && captured == buffers;
+    if (!write_metadata(metadata_fd, options, device, control, status, chopper, dma_size,
+                        buffers, captured, complete, wall_time, max_pending) || ::fsync(metadata_fd) != 0) {
+        std::cerr << "Could not write metadata completely.\n"; capture_ok = false;
+    }
+    ::close(metadata_fd); ::close(device_fd);
+    std::cout << "Captured " << captured << "/" << buffers << " DMA buffers: "
+              << captured * samples_per_buffer << " samples/channel, "
+              << static_cast<double>(captured * samples_per_buffer) / kAdcRateHz << " s.\n"
+              << "Maximum pending DMA buffers reported by driver: " << max_pending << "\n"
+              << "Data: " << options.output << "\nMetadata: " << metadata_path << "\n";
+    if (stop_requested) return 130;
+    return (capture_ok && complete) ? 0 : 1;
+}

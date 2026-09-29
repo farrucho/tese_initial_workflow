@@ -1,32 +1,55 @@
-# Ver os dados da ATCA
+# Captura raw da ATCA
 
-Este programa mostra no terminal os 16 valores `int32` mais recentes da placa
-9. Lê apenas o buffer RT já existente em `/dev/atca_v6_dmart_9`.
+Ferramenta autónoma para guardar os 16 canais raw da placa ATCA a 2 MSPS por
+canal, sem MARTe. Usa a interface DMA de `/dev/atca_v6_9`.
 
-Não usa MARTe, aquisição raw, IRQ ou trigger. Se o fluxo RT estiver desligado,
-o programa liga apenas o bit `StreamE`, mostra os dados e volta a desligá-lo no
-fim. Se já estiver ligado, deixa-o ligado. O programa recusa alterar o stream
-se detetar uma aquisição ativa.
-
-No servidor, basta executar:
+## Utilização
 
 ```bash
-./run.sh
+./run.sh -t 1 -o dados.bin
 ```
 
-Por omissão mostra 20 leituras, separadas por 500 ms. Opcionalmente:
+- `-t`: duração pedida, em segundos;
+- `-o`: ficheiro binário novo;
+- `-b`: número da placa, por omissão `9`.
+
+A aquisição termina num limite de buffer DMA. Com o buffer observado de
+512 KiB, cada buffer contém 8192 amostras por canal e representa 4,096 ms.
+Por isso, `-t 1` produz 1,00352 s, 2 007 040 amostras por canal e 122,5 MiB.
+A captura mínima é de 16 buffers: 65,536 ms e 8 MiB.
+
+É criado também `dados.bin.json`, com duração efetiva, tamanho do buffer,
+número de amostras, estado inicial, chopper, kernel e formato.
+
+## Formato
+
+O binário contém valores `int32` little-endian, sem divisão por `2^14`:
+
+```text
+amostra 0: ch00 ch01 ... ch15
+amostra 1: ch00 ch01 ... ch15
+...
+```
+
+Os dados são escritos à medida que chegam; não é guardada em RAM uma cópia da
+captura inteira. Um segundo ocupa aproximadamente 122 MiB.
+
+## Segurança
+
+Esta é uma aquisição ativa: usa DMA, IRQ, aquisição e software trigger. O
+programa recusa começar se detetar stream, aquisição, DMA ou IRQ ativos. Deve
+ser executado apenas numa janela dedicada, sem MARTe ou outro processo a usar a
+placa. Não altera chopper, offsets nem a taxa do ADC. Na saída desativa apenas
+os mecanismos que iniciou.
+
+`Ctrl+C` tenta terminar de forma limpa. O binário parcial é mantido e
+`complete` fica `false` nos metadados.
+
+## Inspeção local
 
 ```bash
-./run.sh PLACA NUMERO_DE_LEITURAS INTERVALO_MS
+python3 inspect_capture.py dados.bin
 ```
 
-Por exemplo, placa 9, 10 leituras, uma a cada segundo:
-
-```bash
-./run.sh 9 10 1000
-```
-
-Os valores apresentados são contagens ADC (`valor_do_FPGA / 2^14`), seguindo o
-descodificador que acompanha o driver. Não são calibrados para volts. Este
-fluxo já foi decimado pelo FPGA; não contém todas as amostras originais a
-2 MHz.
+Mostra tamanho, número de amostras e estatísticas por canal, sem dependências
+externas de Python.
