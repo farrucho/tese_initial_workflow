@@ -28,6 +28,7 @@ code/
   capture_atca.cpp       código da aquisição
 analysis/
   inspect_capture.py     inspeção e estatísticas
+  plot_capture.py        gráfico de uma janela temporal
   *.bin                  capturas (não entram no Git)
   *.bin.json             metadados (não entram no Git)
 run.sh                   compila e executa a aquisição
@@ -70,3 +71,20 @@ python3 analysis/inspect_capture.py analysis/dados.bin
 
 Mostra tamanho, número de amostras e estatísticas por canal, sem dependências
 externas de Python.
+
+Para desenhar os 16 canais nos primeiros 10 ms:
+
+```bash
+python3 analysis/plot_capture.py analysis/dados.bin
+```
+
+Para escolher uma janela e guardar a figura sem abrir uma janela gráfica:
+
+```bash
+python3 analysis/plot_capture.py analysis/dados.bin \
+  --start 0.2 --duration 0.05 --channels 0,1,2,3 --output analysis/dados.png
+```
+
+O gráfico apresenta por omissão os códigos ADC (`int32 >> 14`). A opção
+`--raw` apresenta as palavras `int32` completas do FPGA. O script necessita de
+Matplotlib (`python3 -m pip install matplotlib`).
