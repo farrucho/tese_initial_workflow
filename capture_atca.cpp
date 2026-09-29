@@ -196,7 +196,11 @@ int main(int argc, char **argv) {
         ioctl_ok(device_fd, kGetDmaSize, &dma_size, "get DMA size") &&
         ioctl_ok(device_fd, kGetChopper, &chopper, "get chopper counters");
     if (!state_ok) { ::close(device_fd); return 1; }
-    const std::uint32_t active_mask = kStreamBit | kAcquisitionBit | kSoftwareTriggerBit | kDmaBit | kDmaResetBit | kIrqBit;
+    // An enabled IRQ alone is safe while acquisition and DMA are stopped. It
+    // is common on this machine, so preserve it instead of rejecting capture.
+    const bool irq_was_enabled = (control & kIrqBit) != 0;
+    const std::uint32_t active_mask = kStreamBit | kAcquisitionBit |
+                                      kSoftwareTriggerBit | kDmaBit | kDmaResetBit;
     if ((control & active_mask) != 0 || (status & kAcquisitionOnStatusBit) != 0) {
         std::cerr << "Board is not idle; refusing active raw capture (control=0x" << std::hex << control
                   << ", status=0x" << status << ").\n"; ::close(device_fd); return 3;
@@ -240,7 +244,10 @@ int main(int argc, char **argv) {
 
     AcquisitionGuard guard(device_fd); std::vector<unsigned char> buffer(dma_size);
     std::uint64_t captured = 0; bool capture_ok = ioctl_ok(device_fd, kDmaReset, "DMA reset");
-    if (capture_ok) { capture_ok = ioctl_ok(device_fd, kIrqEnable, "enable IRQ"); if (capture_ok) guard.irq_enabled(); }
+    if (capture_ok && !irq_was_enabled) {
+        capture_ok = ioctl_ok(device_fd, kIrqEnable, "enable IRQ");
+        if (capture_ok) guard.irq_enabled();
+    }
     if (capture_ok) { capture_ok = ioctl_ok(device_fd, kAcqEnable, "enable acquisition"); if (capture_ok) guard.acquisition_enabled(); }
     if (capture_ok) capture_ok = ioctl_ok(device_fd, kSoftTrigger, "software trigger");
     const auto wall_start = std::chrono::steady_clock::now();

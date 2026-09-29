@@ -37,7 +37,8 @@ captura inteira. Um segundo ocupa aproximadamente 122 MiB.
 ## Segurança
 
 Esta é uma aquisição ativa: usa DMA, IRQ, aquisição e software trigger. O
-programa recusa começar se detetar stream, aquisição, DMA ou IRQ ativos. Deve
+programa recusa começar se detetar stream, aquisição ou DMA ativos. Uma IRQ já
+ativa, por si só, é aceite e preservada. Deve
 ser executado apenas numa janela dedicada, sem MARTe ou outro processo a usar a
 placa. Não altera chopper, offsets nem a taxa do ADC. Na saída desativa apenas
 os mecanismos que iniciou.
