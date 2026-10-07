@@ -3,6 +3,9 @@
 Ferramenta autónoma para guardar os 16 canais raw da placa ATCA a 2 MSPS por
 canal, sem MARTe. Usa a interface DMA de `/dev/atca_v6_9`.
 
+Para perceber o percurso dos dados, os comandos enviados à placa e o formato
+DMA antes de ler o C++, consulta [Como funciona a captura](docs/CAPTURE_FLOW.md).
+
 ## Utilização
 
 ```bash
